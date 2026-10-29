@@ -1,0 +1,1088 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Header, UploadFile, File, Depends
+from fastapi.responses import Response as FastAPIResponse
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from typing import List, Optional
+import uuid
+from datetime import datetime, timezone, timedelta
+import bcrypt
+import jwt
+from bson import ObjectId
+import requests
+from google import genai
+import secrets
+import json
+import re
+
+gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+GEMINI_MODEL = "gemini-3.7-flash"
+def extract_json(text: str) -> dict:
+    """Extract JSON from text that may contain markdown code blocks."""
+    text = text.strip()
+    code_match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
+    if code_match:
+        text = code_match.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        json_match = re.search(r'\{[^{}]*\}', text)
+        if json_match:
+            return json.loads(json_match.group())
+        raise
+
+def extract_json_array(text: str) -> list:
+    """Extract JSON array from text that may contain markdown code blocks."""
+    text = text.strip()
+    code_match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
+    if code_match:
+        text = code_match.group(1).strip()
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+        return [result]
+    except json.JSONDecodeError:
+        arr_match = re.search(r'\[[\s\S]*\]', text)
+        if arr_match:
+            return json.loads(arr_match.group())
+        return []
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# Object Storage Config
+APP_NAME = "memory-replay"
+
+LOCAL_STORAGE_DIR = os.path.join(
+    os.path.dirname(__file__),
+    "uploads"
+)
+
+os.makedirs(LOCAL_STORAGE_DIR, exist_ok=True)
+
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+# Password hashing
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+
+# JWT helpers
+JWT_ALGORITHM = "HS256"
+
+def get_jwt_secret() -> str:
+    return os.environ["JWT_SECRET"]
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(minutes=15), "type": "access"}
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+def create_refresh_token(user_id: str) -> str:
+    payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "refresh"}
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+# Auth helper
+async def get_current_user(request: Request) -> dict:
+    token = request.cookies.get("access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        user["_id"] = str(user["_id"])
+        user.pop("password_hash", None)
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+
+def put_object(path: str, data: bytes, content_type: str) -> dict:
+    """
+    Save an uploaded file to local storage.
+    """
+
+    file_path = os.path.join(LOCAL_STORAGE_DIR, path)
+
+    # Prevent accidental path traversal
+    file_path = os.path.abspath(file_path)
+    storage_root = os.path.abspath(LOCAL_STORAGE_DIR)
+
+    if not file_path.startswith(storage_root + os.sep):
+        raise ValueError("Invalid storage path")
+
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    with open(file_path, "wb") as f:
+        f.write(data)
+
+    return {
+        "path": path,
+        "size": len(data)
+    }
+
+
+def get_object(path: str) -> tuple:
+    """
+    Read a file from local storage.
+    """
+
+    file_path = os.path.join(LOCAL_STORAGE_DIR, path)
+
+    file_path = os.path.abspath(file_path)
+    storage_root = os.path.abspath(LOCAL_STORAGE_DIR)
+
+    if not file_path.startswith(storage_root + os.sep):
+        raise ValueError("Invalid storage path")
+
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {path}")
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    # Determine content type from file extension
+    import mimetypes
+
+    content_type, _ = mimetypes.guess_type(file_path)
+
+    return (
+        data,
+        content_type or "application/octet-stream"
+    )
+# Models
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserResponse(BaseModel):
+    id: str = Field(alias="_id")
+    email: str
+    name: str
+    role: str
+    created_at: str
+    model_config = ConfigDict(populate_by_name=True)
+
+class MemoryCreate(BaseModel):
+    content: str
+    tags: Optional[List[str]] = []
+    location: Optional[str] = None
+
+class MemoryUpdate(BaseModel):
+    content: Optional[str] = None
+    tags: Optional[List[str]] = None
+    location: Optional[str] = None
+
+class MemoryResponse(BaseModel):
+    id: str
+    user_id: str
+    content: str
+    emotion: Optional[str] = None
+    emotion_score: Optional[float] = None
+    tags: List[str]
+    location: Optional[str] = None
+    media_url: Optional[str] = None
+    importance: Optional[int] = None
+    importance_reason: Optional[str] = None
+    shared_by: Optional[str] = None
+    shared_with: Optional[List[str]] = None
+    created_at: str
+    updated_at: str
+
+class ShareMemoryRequest(BaseModel):
+    email: EmailStr
+
+class WhatIfResponse(BaseModel):
+    original: str
+    scenarios: List[dict]
+
+class TranscribeRequest(BaseModel):
+    audio_base64: str
+
+class SearchRequest(BaseModel):
+    query: Optional[str] = None
+    emotion: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+# Startup
+@app.on_event("startup")
+async def startup():
+    try:
+        os.makedirs(LOCAL_STORAGE_DIR, exist_ok=True)
+        logger.info("Local storage initialized")
+    except Exception as e:
+        logger.error(f"Local storage initialization failed: {e}")
+    
+    await db.users.create_index("email", unique=True)
+    await db.password_reset_tokens.create_index("expires_at", expireAfterSeconds=0)
+    await db.login_attempts.create_index("identifier")
+    
+    await seed_admin()
+
+async def seed_admin():
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@memoryengine.com")
+    admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
+
+    existing = await db.users.find_one({"email": admin_email})
+
+    if existing is None:
+        hashed = hash_password(admin_password)
+
+        await db.users.insert_one({
+            "email": admin_email,
+            "password_hash": hashed,
+            "name": "Admin",
+            "role": "admin",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+
+    elif not verify_password(admin_password, existing["password_hash"]):
+        await db.users.update_one(
+            {"email": admin_email},
+            {"$set": {"password_hash": hash_password(admin_password)}}
+        )
+
+    # Store local test credentials inside the project
+    memory_dir = Path(os.path.dirname(__file__)).parent / "memory"
+    memory_dir.mkdir(exist_ok=True)
+
+    with open(memory_dir / "test_credentials.md", "w") as f:
+        f.write("# Test Credentials\n\n")
+        f.write("## Admin Account\n")
+        f.write(f"- Email: {admin_email}\n")
+        f.write(f"- Password: {admin_password}\n")
+        f.write("- Role: admin\n\n")
+        f.write("## Auth Endpoints\n")
+        f.write("- POST /api/auth/register\n")
+        f.write("- POST /api/auth/login\n")
+        f.write("- POST /api/auth/logout\n")
+        f.write("- GET /api/auth/me\n")
+
+# Auth Routes
+@api_router.post("/auth/register")
+async def register(input: RegisterRequest, response: Response):
+    email = input.email.lower()
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    user_id = str(uuid.uuid4())
+    hashed = hash_password(input.password)
+    await db.users.insert_one({
+        "_id": ObjectId(),
+        "email": email,
+        "password_hash": hashed,
+        "name": input.name,
+        "role": "user",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    
+    user = await db.users.find_one({"email": email})
+    user_id = str(user["_id"])
+    access_token = create_access_token(user_id, email)
+    refresh_token = create_refresh_token(user_id)
+    
+    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=900, path="/")
+    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    
+    return {"_id": user_id, "email": user["email"], "name": user["name"], "role": user["role"], "created_at": user["created_at"]}
+
+@api_router.post("/auth/login")
+async def login(input: LoginRequest, response: Response):
+    email = input.email.lower()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(input.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    user_id = str(user["_id"])
+    access_token = create_access_token(user_id, email)
+    refresh_token = create_refresh_token(user_id)
+    
+    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=900, path="/")
+    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    
+    return {"_id": user_id, "email": user["email"], "name": user["name"], "role": user["role"], "created_at": user["created_at"]}
+
+@api_router.post("/auth/logout")
+async def logout(response: Response, user: dict = Depends(get_current_user)):
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+    return {"message": "Logged out successfully"}
+
+@api_router.get("/auth/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    return user
+
+# Memory Routes
+@api_router.post("/memories", response_model=MemoryResponse)
+async def create_memory(input: MemoryCreate, user: dict = Depends(get_current_user)):
+    memory_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    
+    # Analyze emotion
+    emotion_data = await analyze_emotion(input.content)
+    
+    doc = {
+        "id": memory_id,
+        "user_id": user["_id"],
+        "content": input.content,
+        "emotion": emotion_data.get("emotion"),
+        "emotion_score": emotion_data.get("score"),
+        "tags": input.tags or [],
+        "location": input.location,
+        "media_url": None,
+        "created_at": now,
+        "updated_at": now
+    }
+    
+    await db.memories.insert_one(doc)
+    return MemoryResponse(**doc)
+
+async def analyze_emotion(content: str) -> dict:
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"""
+You are an emotion detection expert.
+
+Analyze the following personal memory and determine its primary emotion.
+
+Memory:
+{content}
+
+Return ONLY a JSON object in exactly this format:
+{{
+    "emotion": "happy|sad|fear|anger|neutral",
+    "score": 0.0
+}}
+
+Rules:
+- emotion must be exactly one of: happy, sad, fear, anger, neutral
+- score must be a number between 0.0 and 1.0
+- do not include markdown
+- do not include explanations outside the JSON
+"""
+        )
+
+        result = extract_json(response.text)
+
+        return {
+            "emotion": result.get("emotion", "neutral"),
+            "score": float(result.get("score", 0.5))
+        }
+
+    except Exception as e:
+        logger.error(f"Emotion analysis failed: {e}")
+        return {"emotion": "neutral", "score": 0.5}
+
+@api_router.get("/memories", response_model=List[MemoryResponse])
+async def get_memories(user: dict = Depends(get_current_user)):
+    memories = await db.memories.find({"user_id": user["_id"]}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return [MemoryResponse(**m) for m in memories]
+
+@api_router.get("/memories/insights")
+async def get_insights(user: dict = Depends(get_current_user)):
+    memories = await db.memories.find(
+        {"user_id": user["_id"]},
+        {"_id": 0}
+    ).sort("created_at", 1).to_list(1000)
+
+    if len(memories) < 2:
+        return {
+            "insights": [],
+            "message": "Need at least 2 memories to generate insights."
+        }
+
+    try:
+        memory_data = []
+
+        for m in memories[:30]:
+            entry = {
+                "content": m["content"][:200],
+                "emotion": m.get("emotion", "neutral"),
+                "score": m.get("emotion_score"),
+                "tags": m.get("tags", []),
+                "location": m.get("location"),
+                "importance": m.get("importance"),
+                "date": m.get("created_at", "")[:10]
+            }
+
+            memory_data.append(str(entry))
+
+        combined = "\n".join(memory_data)
+
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"""
+You are a memory intelligence analyst.
+
+Analyze the user's memories and generate deep, personalized insights.
+
+Memories:
+{combined}
+
+Return ONLY a JSON array of insight objects.
+
+Each insight must have exactly these fields:
+- "title": short headline
+- "description": 1-2 sentence explanation with evidence from the memories
+- "category": exactly one of "pattern", "trigger", "recommendation", "highlight"
+- "emotion": exactly one of "happy", "sad", "fear", "anger", "neutral"
+
+Generate 5-8 insights.
+
+Focus on:
+- emotional patterns
+- happiness triggers
+- stress patterns
+- meaningful themes
+- time-based patterns
+- location correlations
+- actionable recommendations
+
+Rules:
+- Be specific and personal, not generic.
+- Return valid JSON.
+- Return ONLY the JSON array.
+- Do not use markdown.
+- Do not include explanations outside the JSON array.
+"""
+        )
+
+        insights = extract_json_array(response.text)
+
+        return {
+            "insights": insights,
+            "memories_analyzed": len(memories[:30])
+        }
+
+    except Exception as e:
+        logger.error(f"Insights generation failed: {e}")
+
+        return {
+            "insights": [],
+            "message": "Unable to generate insights at this time."
+        }
+
+@api_router.get("/memories/shared")
+async def get_shared_memories(user: dict = Depends(get_current_user)):
+    shared = await db.shared_memories.find({"shared_with_email": user["email"]}, {"_id": 0}).sort("shared_at", -1).to_list(100)
+    result = []
+    for s in shared:
+        memory = await db.memories.find_one({"id": s["memory_id"]}, {"_id": 0})
+        if memory:
+            memory["shared_by"] = s.get("shared_by_name", "Someone")
+            result.append(MemoryResponse(**memory))
+    return result
+@api_router.get("/memories/daily-summary")
+async def daily_summary(user: dict = Depends(get_current_user)):
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    ).isoformat()
+
+    memories = await db.memories.find(
+        {
+            "user_id": user["_id"],
+            "created_at": {"$gte": today_start}
+        },
+        {"_id": 0}
+    ).to_list(100)
+
+    if not memories:
+        return {"summary": "No memories created today."}
+
+    try:
+        contents = " ".join(
+            [m["content"] for m in memories[:10]]
+        )
+
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"""
+You are a compassionate memory summarizer.
+
+Create a brief, meaningful summary of the user's memories from today.
+
+Memories:
+{contents}
+
+Rules:
+- Write exactly 2-3 sentences.
+- Make the summary warm and meaningful.
+- Capture the main experiences and emotional tone.
+- Do not use bullet points.
+- Do not use markdown.
+"""
+        )
+
+        return {
+            "summary": response.text.strip(),
+            "memories_count": len(memories)
+        }
+
+    except Exception as e:
+        logger.error(f"Summary generation failed: {e}")
+
+        return {
+            "summary": f"You created {len(memories)} memories today.",
+            "memories_count": len(memories)
+        }
+@api_router.get("/memories/{memory_id}", response_model=MemoryResponse)
+async def get_memory(memory_id: str, user: dict = Depends(get_current_user)):
+    memory = await db.memories.find_one({"id": memory_id, "user_id": user["_id"]}, {"_id": 0})
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return MemoryResponse(**memory)
+
+@api_router.put("/memories/{memory_id}", response_model=MemoryResponse)
+async def update_memory(memory_id: str, input: MemoryUpdate, user: dict = Depends(get_current_user)):
+    memory = await db.memories.find_one({"id": memory_id, "user_id": user["_id"]}, {"_id": 0})
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    
+    update_fields = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    content_changed = False
+    
+    if input.content is not None:
+        update_fields["content"] = input.content
+        content_changed = True
+    if input.tags is not None:
+        update_fields["tags"] = input.tags
+    if input.location is not None:
+        update_fields["location"] = input.location
+    
+    if content_changed:
+        emotion_data = await analyze_emotion(input.content)
+        update_fields["emotion"] = emotion_data.get("emotion")
+        update_fields["emotion_score"] = emotion_data.get("score")
+    
+    await db.memories.update_one({"id": memory_id, "user_id": user["_id"]}, {"$set": update_fields})
+    updated = await db.memories.find_one({"id": memory_id, "user_id": user["_id"]}, {"_id": 0})
+    return MemoryResponse(**updated)
+
+@api_router.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: str, user: dict = Depends(get_current_user)):
+    result = await db.memories.delete_one({"id": memory_id, "user_id": user["_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {"message": "Memory deleted successfully"}
+
+@api_router.post("/memories/{memory_id}/rank")
+async def rank_memory(memory_id: str, user: dict = Depends(get_current_user)):
+    memory = await db.memories.find_one(
+        {"id": memory_id, "user_id": user["_id"]},
+        {"_id": 0}
+    )
+
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"""
+You are a memory importance analyst.
+
+Rate the significance of the following personal memory on a scale from 1 to 10.
+
+Consider:
+- emotional depth
+- life impact
+- uniqueness
+- personal growth potential
+
+Memory:
+{memory['content']}
+
+Return ONLY a JSON object in exactly this format:
+{{
+    "importance": 1,
+    "reason": "brief explanation"
+}}
+
+Rules:
+- importance must be an integer from 1 to 10
+- reason must be a brief explanation
+- do not include markdown
+- do not include anything outside the JSON object
+"""
+        )
+
+        result = extract_json(response.text)
+
+        importance = max(
+            1,
+            min(10, int(result.get("importance", 5)))
+        )
+
+        reason = result.get("reason", "")
+
+        await db.memories.update_one(
+            {"id": memory_id, "user_id": user["_id"]},
+            {
+                "$set": {
+                    "importance": importance,
+                    "importance_reason": reason
+                }
+            }
+        )
+
+        return {
+            "importance": importance,
+            "reason": reason
+        }
+
+    except Exception as e:
+        logger.error(f"Importance ranking failed: {e}")
+
+        return {
+            "importance": 5,
+            "reason": "Unable to analyze importance at this time."
+        }
+
+@api_router.post("/memories/rank-all")
+async def rank_all_memories(user: dict = Depends(get_current_user)):
+    memories = await db.memories.find(
+        {"user_id": user["_id"], "importance": None},
+        {"_id": 0, "id": 1, "content": 1}
+    ).to_list(50)
+
+    if not memories:
+        return {"ranked": 0, "message": "All memories already ranked"}
+
+    ranked = 0
+
+    for mem in memories:
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=f"""
+You are a memory importance analyst.
+
+Rate the significance of the following personal memory on a scale from 1 to 10.
+
+Consider:
+- emotional depth
+- life impact
+- uniqueness
+- personal growth potential
+
+Memory:
+{mem['content']}
+
+Return ONLY a JSON object in exactly this format:
+{{
+    "importance": 1,
+    "reason": "brief explanation"
+}}
+
+Rules:
+- importance must be an integer from 1 to 10
+- reason must be a brief explanation
+- do not include markdown
+- do not include anything outside the JSON object
+"""
+            )
+
+            result = extract_json(response.text)
+
+            importance = max(
+                1,
+                min(10, int(result.get("importance", 5)))
+            )
+
+            reason = result.get("reason", "")
+
+            await db.memories.update_one(
+                {"id": mem["id"], "user_id": user["_id"]},
+                {
+                    "$set": {
+                        "importance": importance,
+                        "importance_reason": reason
+                    }
+                }
+            )
+
+            ranked += 1
+
+        except Exception as e:
+            logger.error(f"Batch rank failed for {mem['id']}: {e}")
+
+    return {
+        "ranked": ranked,
+        "message": f"Ranked {ranked} memories"
+    }
+
+@api_router.post("/memories/{memory_id}/what-if")
+async def what_if_simulation(memory_id: str, user: dict = Depends(get_current_user)):
+    memory = await db.memories.find_one(
+        {"id": memory_id, "user_id": user["_id"]},
+        {"_id": 0}
+    )
+
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    try:
+        context = f"Memory: {memory['content']}"
+
+        if memory.get("emotion"):
+            context += f"\nOriginal emotion: {memory['emotion']}"
+
+        if memory.get("location"):
+            context += f"\nLocation: {memory['location']}"
+
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"""
+You are a creative alternate-reality simulator.
+
+Given a personal memory, imagine 3 different "What-If" alternate outcomes.
+
+For each scenario, explore how things could have gone differently and what the emotional impact would be.
+
+{context}
+
+Return ONLY a JSON array containing exactly 3 objects.
+
+Each object must have exactly these fields:
+- "title": short what-if headline
+- "narrative": 2-3 sentence vivid alternate outcome
+- "emotion": likely emotion, exactly one of: happy, sad, fear, anger, neutral
+- "divergence": the single choice or event that changed, in one sentence
+
+Rules:
+- Return exactly 3 scenarios
+- Return valid JSON
+- Do not use markdown
+- Do not include explanations outside the JSON array
+- Be creative, thought-provoking, and emotionally resonant
+"""
+        )
+
+        scenarios = extract_json_array(response.text)
+
+        return {
+            "original": memory["content"],
+            "original_emotion": memory.get("emotion"),
+            "scenarios": scenarios
+        }
+
+    except Exception as e:
+        logger.error(f"What-if simulation failed: {e}")
+
+        return {
+            "original": memory["content"],
+            "original_emotion": memory.get("emotion"),
+            "scenarios": []
+        }
+
+@api_router.post("/memories/{memory_id}/share")
+async def share_memory(memory_id: str, input: ShareMemoryRequest, user: dict = Depends(get_current_user)):
+    memory = await db.memories.find_one({"id": memory_id, "user_id": user["_id"]}, {"_id": 0})
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    
+    target_email = input.email.lower()
+    target_user = await db.users.find_one({"email": target_email})
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target_email == user["email"]:
+        raise HTTPException(status_code=400, detail="Cannot share with yourself")
+    
+    existing = await db.shared_memories.find_one({"memory_id": memory_id, "shared_with_email": target_email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Already shared with this user")
+    
+    await db.shared_memories.insert_one({
+        "id": str(uuid.uuid4()),
+        "memory_id": memory_id,
+        "shared_by_id": user["_id"],
+        "shared_by_name": user.get("name", "Unknown"),
+        "shared_by_email": user["email"],
+        "shared_with_id": str(target_user["_id"]),
+        "shared_with_email": target_email,
+        "shared_at": datetime.now(timezone.utc).isoformat()
+    })
+    
+    shared_with = memory.get("shared_with", []) or []
+    shared_with.append(target_email)
+    await db.memories.update_one({"id": memory_id}, {"$set": {"shared_with": shared_with}})
+    
+    return {"message": f"Memory shared with {target_email}"}
+
+@api_router.post("/memories/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user)
+):
+    try:
+        audio_data = await file.read()
+
+        if not audio_data:
+            raise HTTPException(
+                status_code=400,
+                detail="Audio file is empty"
+            )
+
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                {
+                    "inline_data": {
+                        "mime_type": file.content_type or "audio/webm",
+                        "data": audio_data
+                    }
+                },
+                """
+Transcribe this audio exactly as spoken.
+
+Rules:
+- Return only the transcription.
+- Do not add explanations.
+- Do not summarize.
+- Preserve the meaning of the speaker's words.
+"""
+            ]
+        )
+
+        return {"text": response.text.strip()}
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+@api_router.post("/memories/upload-image")
+async def upload_image(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    try:
+        ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+        path = f"{APP_NAME}/uploads/{user['_id']}/{uuid.uuid4()}.{ext}"
+        data = await file.read()
+        result = put_object(path, data, file.content_type or "image/jpeg")
+        
+        await db.files.insert_one({
+            "id": str(uuid.uuid4()),
+            "storage_path": result["path"],
+            "original_filename": file.filename,
+            "content_type": file.content_type,
+            "size": result["size"],
+            "user_id": user["_id"],
+            "is_deleted": False,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+        
+        return {"path": result["path"]}
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/files/{path:path}")
+async def download_file(path: str, authorization: str = Header(None)):
+    record = await db.files.find_one({"storage_path": path, "is_deleted": False})
+    if not record:
+        raise HTTPException(status_code=404, detail="File not found")
+    data, content_type = get_object(path)
+    return FastAPIResponse(content=data, media_type=record.get("content_type", content_type))
+
+@api_router.post("/memories/search", response_model=List[MemoryResponse])
+async def search_memories(input: SearchRequest, user: dict = Depends(get_current_user)):
+    query = {"user_id": user["_id"]}
+    
+    if input.query:
+        query["content"] = {"$regex": input.query, "$options": "i"}
+    if input.emotion:
+        query["emotion"] = input.emotion
+    if input.tags:
+        query["tags"] = {"$in": input.tags}
+    if input.start_date:
+        query.setdefault("created_at", {})["$gte"] = input.start_date
+    if input.end_date:
+        query.setdefault("created_at", {})["$lte"] = input.end_date
+    
+    memories = await db.memories.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return [MemoryResponse(**m) for m in memories]
+
+@api_router.get("/memories/{memory_id}/related", response_model=List[MemoryResponse])
+async def get_related_memories(memory_id: str, user: dict = Depends(get_current_user)):
+    memory = await db.memories.find_one({"id": memory_id, "user_id": user["_id"]}, {"_id": 0})
+    if not memory:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    
+    query = {
+        "user_id": user["_id"],
+        "id": {"$ne": memory_id},
+        "$or": [
+            {"emotion": memory.get("emotion")},
+            {"tags": {"$in": memory.get("tags", [])}}
+        ]
+    }
+    
+    related = await db.memories.find(query, {"_id": 0}).limit(5).to_list(5)
+    return [MemoryResponse(**m) for m in related]
+
+@api_router.get("/memories/stats/overview")
+async def get_stats(user: dict = Depends(get_current_user)):
+    total = await db.memories.count_documents({"user_id": user["_id"]})
+    
+    emotions = await db.memories.aggregate([
+        {"$match": {"user_id": user["_id"]}},
+        {"$group": {"_id": "$emotion", "count": {"$sum": 1}}}
+    ]).to_list(10)
+    
+    emotion_breakdown = {e["_id"]: e["count"] for e in emotions if e["_id"]}
+    
+    return {
+        "total_memories": total,
+        "emotion_breakdown": emotion_breakdown
+    }
+
+
+
+@api_router.post("/memories/story-mode")
+async def generate_story(user: dict = Depends(get_current_user)):
+    memories = await db.memories.find(
+        {"user_id": user["_id"]},
+        {"_id": 0}
+    ).sort("created_at", 1).to_list(50)
+
+    if not memories:
+        return {
+            "story": "No memories to weave into a story yet. Start capturing your experiences."
+        }
+
+    try:
+        memory_texts = []
+
+        for m in memories[:20]:
+            entry = (
+                f"[{m.get('created_at', 'Unknown date')}] "
+                f"({m.get('emotion', 'neutral')}): {m['content']}"
+            )
+
+            if m.get("location"):
+                entry += f" [Location: {m['location']}]"
+
+            memory_texts.append(entry)
+
+        combined = "\n".join(memory_texts)
+
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=f"""
+You are a literary storyteller.
+
+Given a series of personal memories with emotions, dates, and locations, weave them into a beautiful, cohesive first-person narrative.
+
+Use:
+- vivid imagery
+- emotional depth
+- natural transitions
+- flowing prose
+- meaningful connections between the memories
+
+Write as if composing a memoir chapter.
+
+Memories:
+{combined}
+
+Rules:
+- Write in first person.
+- Use natural paragraph breaks.
+- Do not use bullet points.
+- Do not use numbered lists.
+- Do not include headings.
+- Do not mention that you are an AI.
+- Return only the finished story.
+"""
+        )
+
+        return {
+            "story": response.text.strip(),
+            "memories_used": len(memories[:20])
+        }
+
+    except Exception as e:
+        logger.error(f"Story generation failed: {e}")
+
+        return {
+            "story": "Unable to generate story at this time. Please try again later.",
+            "memories_used": 0
+        }
+
+@api_router.get("/memories/stats/emotion-timeline")
+async def emotion_timeline(user: dict = Depends(get_current_user)):
+    memories = await db.memories.find({"user_id": user["_id"]}, {"_id": 0}).sort("created_at", 1).to_list(1000)
+    
+    timeline = {}
+    for m in memories:
+        date = m.get("created_at", "")[:10]
+        emotion = m.get("emotion", "neutral")
+        if date not in timeline:
+            timeline[date] = {"date": date, "happy": 0, "sad": 0, "fear": 0, "anger": 0, "neutral": 0, "total": 0}
+        timeline[date][emotion] = timeline[date].get(emotion, 0) + 1
+        timeline[date]["total"] += 1
+    
+    return list(timeline.values())
+
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
